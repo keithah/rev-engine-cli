@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+"""rev-engine — run the RevEngine reviewer locally, on a branch or on a pull request.
+
+RevEngine (laude-institute/rev-engine) is built as a ReviewBench agent container:
+it reads a pull request from a fixed mount layout, then writes a findings file.
+This wrapper reproduces that contract on the local filesystem, so the reviewer
+runs as a plain Node program with no Docker image and no GitHub Action.
+
+Modes
+  branch   Review the committed diff of the current branch against its merge-base
+           with the base branch. Pre-PR: same place Steward runs.
+  pr       Review a pull request at its current head in a throwaway git worktree.
+           Post-PR: same place CodeRabbit runs.
+
+Examples
+  rev-engine doctor
+  rev-engine branch --repo . --base main
+  rev-engine branch --repo ~/work/yarr --json
+  rev-engine pr 130 --repo ~/work/yarr --post-mode
+
+Exit codes
+  0  review produced          1  review failed          2  usage error
+  3  findings at or above --fail-on
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_ENGINE_HOME = Path.home() / "work" / "rev-engine"
+CACHE_HOME = Path(os.environ.get("REV_ENGINE_CACHE", Path.home() / ".cache" / "rev-engine"))
+SEVERITIES = ["high", "medium", "low"]
+SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
+
+# Settings the container reads, spelled as the RB_CONFIG_* name the CLI exposes.
+SETTING_ENV = {
+    "engine": "RB_CONFIG_ENGINE",
+    "model": "RB_CONFIG_MODEL",
+    "verifier": "RB_CONFIG_VERIFIER",
+    "verify": "RB_CONFIG_VERIFY",
+    "second_look": "RB_CONFIG_SECOND_LOOK",
+    "min_severity": "RB_CONFIG_MIN_SEVERITY",
+    "max_findings": "RB_CONFIG_MAX_FINDINGS",
+    "time_budget": "RB_CONFIG_TIME_BUDGET",
+    "max_turns": "RB_CONFIG_MAX_TURNS",
+    "mode": "RB_CONFIG_MODE",
+    "effort": "RB_CONFIG_EFFORT",
+    "fit": "RB_CONFIG_FIT",
+    "follow_up": "RB_CONFIG_FOLLOW_UP",
+    "retry_empty": "RB_CONFIG_RETRY_EMPTY",
+}
+
+
+class Fail(Exception):
+    """A problem with the run, reported without a traceback."""
+
+
+# --------------------------------------------------------------------------- #
+# process helpers
+# --------------------------------------------------------------------------- #
+
+
+def sh(args: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
+    result = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        raise Fail(f"{' '.join(args[:3])} failed: {detail[-1] if detail else result.returncode}")
+    return result
+
+
+def out(args: list[str], cwd: Path | None = None) -> str:
+    return sh(args, cwd=cwd).stdout.strip()
+
+
+def say(message: str = "") -> None:
+    print(message, flush=True)
+
+
+def note(message: str) -> None:
+    print(f"rev-engine: {message}", file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# repository inspection
+# --------------------------------------------------------------------------- #
+
+
+def repo_root(path: Path) -> Path:
+    result = sh(["git", "rev-parse", "--show-toplevel"], cwd=path, check=False)
+    if result.returncode != 0:
+        raise Fail(f"{path} is not inside a git working tree")
+    return Path(result.stdout.strip())
+
+
+def primary_remote(repo: Path) -> str:
+    """origin when it exists, otherwise whatever remote the clone uses."""
+    names = sh(["git", "remote"], cwd=repo, check=False).stdout.split()
+    if "origin" in names:
+        return "origin"
+    if names:
+        return names[0]
+    return "origin"
+
+
+def nwo_of(repo: Path) -> str:
+    """owner/repo from the primary remote, so findings name a real repository."""
+    url = sh(["git", "config", "--get", f"remote.{primary_remote(repo)}.url"], cwd=repo, check=False).stdout.strip()
+    if not url:
+        return f"local/{repo.name}"
+    match = re.search(r"[/:]([^/:]+)/([^/]+?)(?:\.git)?$", url)
+    if not match:
+        return f"local/{repo.name}"
+    return f"{match.group(1)}/{match.group(2)}"
+
+
+def default_base(repo: Path) -> str:
+    """The branch a PR would target: origin's HEAD, then the usual names."""
+    result = sh(["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], cwd=repo, check=False)
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip().removeprefix("refs/remotes/")
+    for candidate in ("origin/main", "origin/master", "main", "master"):
+        probe = sh(["git", "rev-parse", "--verify", "--quiet", candidate], cwd=repo, check=False)
+        if probe.returncode == 0:
+            return candidate
+    raise Fail("cannot tell the base branch; pass --base <ref>")
+
+
+def commit_sha(repo: Path, ref: str) -> str:
+    result = sh(["git", "rev-parse", ref], cwd=repo, check=False)
+    if result.returncode != 0:
+        raise Fail(f"cannot resolve {ref} to a commit")
+    return result.stdout.strip()
+
+
+def merge_base(repo: Path, base: str, head: str) -> str:
+    result = sh(["git", "merge-base", base, head], cwd=repo, check=False)
+    if result.returncode != 0:
+        raise Fail(f"{base} and {head} have no merge-base; pass --base <ref>")
+    return result.stdout.strip()
+
+
+def require_clean(repo: Path) -> None:
+    dirty = sh(["git", "status", "--porcelain"], cwd=repo).stdout.strip()
+    if dirty:
+        first = dirty.splitlines()[0]
+        raise Fail(f"working tree has uncommitted changes ({first}); the reviewer reads the tree at head, so commit or stash first")
+
+
+# --------------------------------------------------------------------------- #
+# run workspace
+# --------------------------------------------------------------------------- #
+
+
+def new_run_dir(label: str) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-") or "run"
+    run = CACHE_HOME / "runs" / f"{stamp}-{slug}"
+    for sub in ("pr", "out", "logs"):
+        (run / sub).mkdir(parents=True, exist_ok=True)
+    return run
+
+
+def write_inputs(run: Path, *, nwo: str, number: int, base: str, head: str, diff: str, title: str, body: str) -> dict:
+    (run / "pr" / "diff.patch").write_text(diff if diff.endswith("\n") else diff + "\n")
+    pr_json = {
+        "repo": f"https://github.com/{nwo}",
+        "nwo": nwo,
+        "pr_number": number,
+        "base": base,
+        "head": head,
+        "title": title,
+        "body": body,
+    }
+    (run / "pr" / "pr.json").write_text(json.dumps(pr_json, indent=2) + "\n")
+    return pr_json
+
+
+def build_env(run: Path, *, nwo: str, number: int, base: str, head: str, repo: Path, settings: dict[str, str]) -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("RB_")}
+    env.update(
+        {
+            "RB_NWO": nwo,
+            "RB_PR_NUMBER": str(number),
+            "RB_BASE": base,
+            "RB_HEAD": head,
+            "RB_AGENT": "rev-engine-prime",
+            "RB_REPO": str(repo),
+            "RB_DIFF": str(run / "pr" / "diff.patch"),
+            "RB_PR_JSON": str(run / "pr" / "pr.json"),
+            "RB_PRIOR_JSON": str(run / "pr" / "prior.json"),
+            "RB_OUT": str(run / "out" / "findings.json"),
+            "RB_DETAILS_OUT": str(run / "out" / "details.json"),
+            "RB_CONTEXT_OUT": str(run / "out" / "context.json"),
+            "RB_ATTEMPT": "1",
+            "NO_COLOR": "1",
+        }
+    )
+    for name, value in settings.items():
+        if value is not None and value != "":
+            env[SETTING_ENV[name]] = str(value)
+    return env
+
+
+# --------------------------------------------------------------------------- #
+# the reviewer
+# --------------------------------------------------------------------------- #
+
+
+def engine_home() -> Path:
+    home = Path(os.environ.get("REV_ENGINE_HOME", DEFAULT_ENGINE_HOME)).expanduser()
+    entry = home / "src" / "main.ts"
+    if not entry.is_file():
+        raise Fail(f"no RevEngine checkout at {home} (expected src/main.ts); set REV_ENGINE_HOME or clone it there")
+    return home
+
+
+def run_reviewer(home: Path, env: dict[str, str], run: Path, quiet: bool) -> int:
+    log_path = run / "logs" / "reviewer.log"
+    note(f"reviewing with the rev-engine in {home}")
+    note(f"run directory {run}")
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            ["node", str(home / "src" / "main.ts")],
+            cwd=home,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert process.stdout is not None and process.stderr is not None
+        for line in process.stderr:
+            log.write(line)
+            log.flush()
+            if not quiet:
+                print(line.rstrip(), file=sys.stderr, flush=True)
+        forwarded = process.stdout.read()
+        log.write(forwarded)
+    return process.wait()
+
+
+# --------------------------------------------------------------------------- #
+# reporting
+# --------------------------------------------------------------------------- #
+
+
+def load_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def render(run: Path, meta: dict, json_mode: bool) -> tuple[int, int]:
+    """Print the review; return (findings shown, count at or above each severity)."""
+    findings_file = load_json(run / "out" / "findings.json") or {}
+    details = load_json(run / "out" / "details.json") or {}
+    fit = load_json(run / "out" / "fit.json")
+    usage = findings_file.get("usage") or {}
+
+    rows = details.get("findings") or []
+    if not rows:
+        rows = [
+            {
+                "file": item.get("file"),
+                "start_line": item.get("start_line"),
+                "end_line": item.get("end_line"),
+                "severity": "medium",
+                "title": "",
+                "detail": item.get("message", ""),
+                "confirmed": None,
+            }
+            for item in findings_file.get("findings", [])
+        ]
+    rows.sort(key=lambda row: (SEVERITY_RANK.get(row.get("severity", "low"), 3), row.get("file") or ""))
+
+    if json_mode:
+        print(json.dumps({"meta": meta, "findings": rows, "fit": fit,
+                          "decided": details.get("decided", []), "usage": usage}, indent=2))
+        return len(rows), 0
+
+    tense = {"high": "high", "medium": "medium", "low": "low"}
+    counts = {name: sum(1 for row in rows if row.get("severity") == name) for name in SEVERITIES}
+    head = f"{len(rows)} finding(s)"
+    if rows:
+        head += " — " + ", ".join(f"{counts[name]} {tense[name]}" for name in SEVERITIES if counts[name])
+    say()
+    say(f"  {meta['repo']}{'#' + str(meta['pr']) if meta.get('pr') else ''}  "
+        f"{meta['head'][:10]} vs {meta['base'][:10]}  ({meta['mode']}, {meta['engine']})")
+    say(f"  {head}   {meta['seconds']:.0f}s")
+    if rows:
+        say()
+    for row in rows:
+        where = f"{row.get('file')}:{row.get('start_line')}"
+        if row.get("end_line") and row.get("end_line") != row.get("start_line"):
+            where += f"-{row['end_line']}"
+        badge = str(row.get("severity", "?")).upper().ljust(6)
+        title = row.get("title") or ""
+        say(f"  {badge} {where}  {title}".rstrip())
+        for line in (row.get("detail") or "").splitlines():
+            say(f"         {line}")
+        if row.get("confirmed") is False:
+            say("         (unconfirmed by the verifier — kept because verification was lenient)")
+        say()
+
+    decided = details.get("decided") or []
+    if decided:
+        say(f"  {len(decided)} earlier finding(s) suppressed by prior decisions:")
+        for item in decided:
+            say(f"    {item.get('file')}: {item.get('title')}")
+        say()
+
+    if fit:
+        verdict = fit.get("belongs") if isinstance(fit, dict) else None
+        if verdict is not None:
+            say(f"  fit: {'belongs' if verdict else 'does not belong'}"
+                + (f" — {fit.get('reason')}" if isinstance(fit, dict) and fit.get("reason") else ""))
+    if usage:
+        cost = usage.get("cost_usd")
+        bits = [f"{meta['seconds']:.0f}s"]
+        if usage.get("total_tokens"):
+            bits.append(f"{usage['total_tokens']} tokens")
+        if cost:
+            bits.append(f"${cost:.4f} at API prices")
+        say(f"  {' · '.join(bits)}")
+    say()
+    return len(rows), counts["high"]
+
+
+# --------------------------------------------------------------------------- #
+# modes
+# --------------------------------------------------------------------------- #
+
+
+def do_branch(args, settings: dict[str, str]) -> int:
+    repo = repo_root(Path(args.repo).expanduser())
+    require_clean(repo)
+    head = commit_sha(repo, "HEAD")
+    base_ref = args.base or os.environ.get("REV_BASE") or default_base(repo)
+    base = merge_base(repo, base_ref, head)
+    if base == head:
+        raise Fail(f"HEAD is {base_ref}; switch to the branch you want reviewed")
+    diff = sh(["git", "diff", "--no-color", f"{base}..{head}"], cwd=repo).stdout
+    if not diff.strip():
+        raise Fail("the branch has no changes against its merge-base")
+    title = out(["git", "log", "--format=%s", "-1", head], cwd=repo)
+    body = out(["git", "log", "--format=%b", f"{base}..{head}"], cwd=repo)
+
+    run = new_run_dir(f"branch-{nwo_of(repo).replace('/', '-')}-{head[:8]}")
+    pr_json = write_inputs(run, nwo=nwo_of(repo), number=args.pr_number, base=base,
+                           head=head, diff=diff, title=f"[branch] {title}", body=body)
+    env = build_env(run, nwo=nwo_of(repo), number=args.pr_number, base=base, head=head,
+                    repo=repo, settings=settings)
+    return finish(args, run, env, settings, mode="branch", repo=repo, base=base, head=head,
+                  number=args.pr_number, pr_json=pr_json)
+
+
+def do_pr(args, settings: dict[str, str]) -> int:
+    repo = repo_root(Path(args.repo).expanduser())
+    if not shutil.which("gh"):
+        raise Fail("pr mode needs the gh CLI")
+    info = sh(["gh", "pr", "view", str(args.number), "--json",
+               "baseRefOid,headRefOid,baseRefName,title,body"], cwd=repo, check=False)
+    if info.returncode != 0:
+        raise Fail(f"gh could not read PR {args.number} in {repo}: {(info.stderr or '').strip().splitlines()[-1:] or info.returncode}")
+    data = json.loads(info.stdout)
+    head = data["headRefOid"]
+    base_ref = args.base or data.get("baseRefName") or default_base(repo)
+
+    # The reviewer reads the tree at head, so review a throwaway checkout and
+    # leave the user's working tree alone.
+    remote = primary_remote(repo)
+    if sh(["git", "cat-file", "-e", f"{head}^{{commit}}"], cwd=repo, check=False).returncode != 0:
+        sh(["git", "fetch", "--quiet", remote, f"pull/{args.number}/head"], cwd=repo)
+        head = commit_sha(repo, "FETCH_HEAD")
+    if sh(["git", "rev-parse", "--verify", "--quiet", base_ref], cwd=repo, check=False).returncode != 0:
+        sh(["git", "fetch", "--quiet", remote, base_ref], cwd=repo, check=False)
+    base = merge_base(repo, base_ref, head)
+
+    worktree = CACHE_HOME / "worktrees" / f"pr-{args.number}-{head[:8]}"
+    created = False
+    if not (worktree / ".git").exists():
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        if worktree.exists():
+            shutil.rmtree(worktree, ignore_errors=True)
+        sh(["git", "worktree", "add", "--detach", "--force", str(worktree), head], cwd=repo)
+        created = True
+
+    try:
+        diff = sh(["git", "diff", "--no-color", f"{base}..{head}"], cwd=repo).stdout
+        if not diff.strip():
+            raise Fail(f"PR {args.number} has no diff against {base_ref}")
+        run = new_run_dir(f"pr-{args.number}-{nwo_of(repo).replace('/', '-')}-{head[:8]}")
+        pr_json = write_inputs(run, nwo=nwo_of(repo), number=args.number, base=base, head=head,
+                               diff=diff, title=data.get("title", ""), body=data.get("body", "") or "")
+        if args.prior != "off":
+            collect_prior(args, run, nwo_of(repo), args.number)
+        env = build_env(run, nwo=nwo_of(repo), number=args.number, base=base, head=head,
+                        repo=worktree, settings=settings)
+        return finish(args, run, env, settings, mode="pr", repo=repo, base=base, head=head,
+                      number=args.number, pr_json=pr_json)
+    finally:
+        if created and not args.keep:
+            sh(["git", "worktree", "remove", "--force", str(worktree)], cwd=repo, check=False)
+
+
+def collect_prior(args, run: Path, nwo: str, number: int) -> None:
+    """Gather decisions on RevEngine's own earlier review threads, if any.
+
+    Only threads RevEngine posted are read (the collector keys off the action
+    bot's marker), so CodeRabbit threads are not consulted. A failure is a
+    warning: the review simply runs without prior decisions.
+    """
+    if args.prior and args.prior != "auto":
+        source = Path(args.prior).expanduser()
+        if source.is_file():
+            shutil.copy(source, run / "pr" / "prior.json")
+            return
+        note(f"prior decisions file {source} not found; reviewing without it")
+        return
+    token = os.environ.get("GITHUB_TOKEN") or sh(["gh", "auth", "token"], check=False).stdout.strip()
+    if not token:
+        return
+    home = engine_home()
+    env = dict(os.environ, GITHUB_TOKEN=token, RB_NWO=nwo, RB_PR_NUMBER=str(number),
+               PRIOR_PATH=str(run / "pr" / "prior.json"))
+    result = subprocess.run(["node", str(home / "action" / "collect.ts")], cwd=home, env=env,
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        note("could not collect earlier review decisions; reviewing without them")
+
+
+def finish(args, run: Path, env: dict[str, str], settings: dict[str, str], *, mode: str,
+           repo: Path, base: str, head: str, number: int, pr_json: dict) -> int:
+    home = engine_home()
+    if args.dry_run:
+        say(f"  run directory {run}")
+        say(f"  repo    {env['RB_REPO']}\n  base    {env['RB_BASE']}\n  head    {env['RB_HEAD']}"
+            f"\n  diff    {env['RB_DIFF']} ({len((run / 'pr' / 'diff.patch').read_text().splitlines())} lines)")
+        for key in sorted(k for k in env if k.startswith("RB_CONFIG_")):
+            say(f"  {key}={env[key]}")
+        if (run / "pr" / "prior.json").is_file():
+            decided = len((load_json(run / "pr" / "prior.json") or {}).get("findings", []))
+            say(f"  prior   {decided} earlier finding(s) carried in")
+        return 0
+    started = time.time()
+    code = run_reviewer(home, env, run, args.quiet)
+    seconds = time.time() - started
+    meta = {
+        "mode": mode,
+        "repo": nwo_of(repo),
+        "pr": number if mode == "pr" else None,
+        "base": base,
+        "head": head,
+        "engine": settings.get("engine"),
+        "model": settings.get("model"),
+        "seconds": seconds,
+        "run_dir": str(run),
+        "exit": code,
+    }
+    (run / "run.json").write_text(json.dumps({"meta": meta, "settings": settings,
+                                              "env": {k: v for k, v in env.items() if k.startswith("RB_")}},
+                                             indent=2) + "\n")
+    shown, high = render(run, meta, args.json)
+
+    if code != 0:
+        note(f"the reviewer failed; log at {run / 'logs' / 'reviewer.log'}")
+        return 1
+    threshold = args.fail_on
+    if threshold != "none":
+        counts = {name: 0 for name in SEVERITIES}
+        details = load_json(run / "out" / "details.json") or {}
+        for row in details.get("findings", []):
+            name = row.get("severity", "low")
+            counts[name] = counts.get(name, 0) + 1
+        reached = {
+            "high": bool(counts["high"]),
+            "medium": bool(counts["high"] or counts["medium"]),
+            "low": any(counts.values()),
+        }[threshold]
+        if reached:
+            note(f"{threshold} severity reached (high {counts['high']}, medium {counts['medium']}, low {counts['low']})")
+            return 3
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# doctor
+# --------------------------------------------------------------------------- #
+
+
+def do_doctor(args) -> int:
+    ok = True
+    say("rev-engine doctor")
+    node = shutil.which("node")
+    if node:
+        version = sh(["node", "-v"], check=False).stdout.strip()
+        major = int(re.match(r"v(\d+)", version).group(1)) if re.match(r"v(\d+)", version) else 0
+        good = major >= 24
+        ok &= good
+        say(f"  node      {version} {'ok' if good else 'need >= 24'}")
+    else:
+        ok = False
+        say("  node      missing (need >= 24)")
+    try:
+        home = engine_home()
+        sha = sh(["git", "rev-parse", "--short", "HEAD"], cwd=home, check=False).stdout.strip()
+        branch = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=home, check=False).stdout.strip()
+        say(f"  engine    {home} ({branch} {sha})")
+    except Fail as error:
+        ok = False
+        say(f"  engine    {error}")
+    claude = shutil.which("claude")
+    if claude:
+        version = sh(["claude", "--version"], check=False).stdout.strip()
+        credentials = Path.home() / ".claude" / ".credentials.json"
+        say(f"  claude    {version} ({'credentials present' if credentials.exists() else 'not logged in'})")
+    else:
+        say("  claude    missing (needed for --engine claude-code)")
+    if os.environ.get("OPENROUTER_API_KEY"):
+        say("  openrouter key present (needed for --engine api)")
+    else:
+        say("  openrouter key absent (only --engine api needs it)")
+    say(f"  gh        {'present' if shutil.which('gh') else 'missing (pr mode needs it)'}")
+    say(f"  cache     {CACHE_HOME}")
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------- #
+# command line
+# --------------------------------------------------------------------------- #
+
+
+def add_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--repo", default=".", help="repository to review (default: .)")
+    parser.add_argument("--base", help="base branch or ref (default: origin/HEAD, then main/master)")
+    parser.add_argument("--engine", choices=["auto", "claude-code", "api"], default="auto",
+                        help="claude-code uses the local Claude Code login; api needs OPENROUTER_API_KEY")
+    parser.add_argument("--model", help="reviewer model (comma-separated for several seats)")
+    parser.add_argument("--verifier", help="verification model (default: the reviewer model)")
+    parser.add_argument("--verify", choices=["lenient", "strict", "off"], default="lenient")
+    parser.add_argument("--second-look", choices=["on", "off", "sweep", "sweep-low", "small"], default="on")
+    parser.add_argument("--mode", choices=["human", "agent"], default="human")
+    parser.add_argument("--min-severity", choices=["high", "medium", "low"], default="low")
+    parser.add_argument("--max-findings", type=int)
+    parser.add_argument("--time-budget", type=int, default=780, help="seconds (default 780)")
+    parser.add_argument("--max-turns", type=int)
+    parser.add_argument("--effort", help="reasoning effort, for models that accept one")
+    parser.add_argument("--fit", default="off", help="'on' to also judge whether the change belongs; or a model name")
+    parser.add_argument("--prior", default="auto",
+                        help="pr mode: 'auto' collect earlier decisions, 'off', or a prior.json path")
+    parser.add_argument("--pr-number", type=int, default=1,
+                        help="synthetic PR number for branch mode (default 1)")
+    parser.add_argument("--json", action="store_true", help="print findings as JSON")
+    parser.add_argument("--quiet", action="store_true", help="suppress the reviewer's progress log")
+    parser.add_argument("--keep", action="store_true", help="keep the pr-mode worktree")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="build the inputs and print the reviewer's environment, then stop")
+    parser.add_argument("--fail-on", choices=["none", "high", "medium", "low"], default="none",
+                        help="exit 3 when findings reach this severity")
+    parser.add_argument("--set", action="append", metavar="KEY=VALUE", default=[],
+                        help="raw RB_CONFIG_<KEY>=VALUE override, repeatable")
+
+
+def settings_from(args) -> dict[str, str]:
+    engine = args.engine
+    if engine == "auto":
+        engine = "claude-code" if shutil.which("claude") else "api"
+    if engine == "api" and not os.environ.get("OPENROUTER_API_KEY"):
+        raise Fail("--engine api needs OPENROUTER_API_KEY in the environment")
+    settings = {
+        "engine": engine,
+        "model": args.model or ("opus" if engine == "claude-code" else "openai/gpt-6-luna"),
+        "verifier": args.verifier,
+        "verify": args.verify,
+        "second_look": args.second_look,
+        "min_severity": args.min_severity,
+        "mode": args.mode,
+        "time_budget": args.time_budget,
+        "effort": args.effort,
+    }
+    if args.max_findings:
+        settings["max_findings"] = args.max_findings
+    if args.max_turns:
+        settings["max_turns"] = args.max_turns
+    if args.fit and args.fit != "off":
+        settings["fit"] = args.model or "opus"
+    for item in args.set:
+        if "=" not in item:
+            raise Fail(f"--set wants KEY=VALUE, got {item}")
+        key, value = item.split("=", 1)
+        if key not in SETTING_ENV:
+            raise Fail(f"unknown setting {key}; known: {', '.join(sorted(SETTING_ENV))}")
+        settings[key] = value
+    return settings
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="rev-engine",
+        description="Run the RevEngine reviewer locally on a branch or a pull request.",
+        epilog="See %(prog)s <mode> --help for the review settings.",
+    )
+    subs = parser.add_subparsers(dest="command", required=True)
+
+    branch = subs.add_parser("branch", help="review the committed diff of the current branch (pre-PR)")
+    add_common(branch)
+
+    pr = subs.add_parser("pr", help="review a pull request at its head (post-PR)")
+    pr.add_argument("number", type=int)
+    add_common(pr)
+
+    doctor = subs.add_parser("doctor", help="check node, the engine checkout and the credentials")
+    doctor.set_defaults(func=do_doctor)
+
+    args = parser.parse_args(argv)
+
+    if args.command == "doctor":
+        return do_doctor(args)
+
+    try:
+        settings = settings_from(args)
+        if args.command == "branch":
+            return do_branch(args, settings)
+        return do_pr(args, settings)
+    except Fail as error:
+        note(str(error))
+        return 2
+    except KeyboardInterrupt:
+        note("interrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
