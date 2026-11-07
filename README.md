@@ -12,6 +12,7 @@ reviewer runs as a plain Node program — no Docker image, no GitHub Action, no
 ## Install
 
 ```sh
+git clone https://github.com/keithah/rev-engine-cli.git ~/work/rev-engine-cli
 git clone -b claude-code-engine https://github.com/clementperon/rev-engine.git ~/work/rev-engine
 ln -sf ~/work/rev-engine-cli/bin/rev-engine ~/.local/bin/rev-engine
 rev-engine doctor
